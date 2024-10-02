@@ -6,7 +6,10 @@ import time
 from datetime import datetime
 
 import git
+import pytz
 import requests
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 
 # Setup logging
 logging.basicConfig(
@@ -18,8 +21,17 @@ API_KEY = os.getenv("LASTFM_API_KEY")
 USERNAME = os.getenv("LASTFM_USERNAME")
 README_FILE = "README.md"
 API_URL = "http://ws.audioscrobbler.com/2.0/"
-REPO_PATH = os.getenv("REPO_PATH", ".")  # Path to your git repository
+REPO_PATH = os.getenv("REPO_PATH", ".")
 UPDATE_INTERVAL = 60  # Check for updates every 60 seconds
+
+# Set up a session with retries
+session = requests.Session()
+retries = Retry(total=5, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+session.mount("http://", HTTPAdapter(max_retries=retries))
+session.mount("https://", HTTPAdapter(max_retries=retries))
+
+# Indian timezone
+indian_tz = pytz.timezone("Asia/Kolkata")
 
 
 def get_current_track():
@@ -31,7 +43,7 @@ def get_current_track():
         "limit": 1,
     }
     try:
-        response = requests.get(API_URL, params=params)
+        response = session.get(API_URL, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
         track = data["recenttracks"]["track"][0]
@@ -47,49 +59,35 @@ def get_current_track():
 
 
 def create_now_playing_block(track):
-    return f"""
-> **Now Playing:** {track['name']} - {track['artist']} [{track['album']}]
+    current_time = datetime.now(indian_tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+    return f"""> **Now Playing:** {track['name']} - {track['artist']} [{track['album']}]
 > 
-> [Last.fm]({track['url']}) | Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-"""
+> [Last.fm]({track['url']}) | Updated: {current_time}"""
 
 
-def update_repo(track):
+def update_repo(track, repo, readme_path):
     try:
-        repo = git.Repo(REPO_PATH)
-        readme_path = os.path.join(REPO_PATH, README_FILE)
-
         with open(readme_path, "r") as file:
             content = file.read()
 
         new_block = create_now_playing_block(track)
-
-        # Check if the info block already exists
         pattern = r"(> \*\*Now Playing:\*\*.*\n>.*\n>.*(?:\n>.*)*)"
+
         if re.search(pattern, content):
-            # Replace existing info block
             new_content = re.sub(pattern, new_block.strip(), content)
         else:
-            # Add new info block at the end
             new_content = content.rstrip() + "\n\n" + new_block
 
-        # Check if there are any changes
         if new_content == content:
             logging.info("No changes detected. Skipping update.")
             return
 
-        # Write the updated content
         with open(readme_path, "w") as file:
             file.write(new_content)
 
-        # Stage the changes
         repo.git.add(README_FILE)
-
-        # Amend the last commit and update its timestamp
-        commit_message = f"Update Now Playing Information\n\nLast updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        commit_message = f"Update Now Playing Information\n\nLast updated: {datetime.now(indian_tz).strftime('%Y-%m-%d %H:%M:%S %Z')}"
         repo.git.commit("--amend", "-m", commit_message)
-
-        # Force push the amended commit
         repo.git.push("--force")
         logging.info("Repository updated with amended 'Now Playing' information.")
     except git.GitCommandError as e:
@@ -99,11 +97,13 @@ def update_repo(track):
 
 
 def get_track_hash(track):
-    if not track:
-        return None
-    return hashlib.md5(
-        f"{track['artist']}:{track['name']}:{track['album']}".encode()
-    ).hexdigest()
+    return (
+        hashlib.md5(
+            f"{track['artist']}:{track['name']}:{track['album']}".encode()
+        ).hexdigest()
+        if track
+        else None
+    )
 
 
 def main():
@@ -113,22 +113,21 @@ def main():
         )
         return
 
+    repo = git.Repo(REPO_PATH)
+    readme_path = os.path.join(REPO_PATH, README_FILE)
     last_track_hash = None
 
     while True:
         track = get_current_track()
         if not track:
             logging.error("Failed to get track information.")
-            time.sleep(UPDATE_INTERVAL)
-            continue
-
-        current_track_hash = get_track_hash(track)
-
-        if current_track_hash != last_track_hash:
-            update_repo(track)
-            last_track_hash = current_track_hash
         else:
-            logging.info("Track hasn't changed. Skipping update.")
+            current_track_hash = get_track_hash(track)
+            if current_track_hash != last_track_hash:
+                update_repo(track, repo, readme_path)
+                last_track_hash = current_track_hash
+            else:
+                logging.info("Track hasn't changed. Skipping update.")
 
         time.sleep(UPDATE_INTERVAL)
 
